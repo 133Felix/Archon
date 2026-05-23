@@ -38,6 +38,7 @@ const mockGetWorkflowRun = mock(() => Promise.resolve(null));
 const mockResumeWorkflowRun = mock(() => Promise.resolve({ id: 'run-id', status: 'running' }));
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockUpdateWorkflowRun = mock(() => Promise.resolve());
+const mockAbandonResumableRunsForConversation = mock(() => Promise.resolve(0));
 
 // Workflow events database mocks
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -90,6 +91,7 @@ mock.module('../db/workflows', () => ({
   resumeWorkflowRun: mockResumeWorkflowRun,
   failWorkflowRun: mockFailWorkflowRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
+  abandonResumableRunsForConversation: mockAbandonResumableRunsForConversation,
 }));
 
 mock.module('../db/workflow-events', () => ({
@@ -641,18 +643,37 @@ describe('CommandHandler', () => {
         });
         mockDeactivateSession.mockResolvedValue(undefined);
 
+        mockAbandonResumableRunsForConversation.mockResolvedValueOnce(2);
+
         const result = await handleCommand(baseConversation, '/reset');
         expect(result.success).toBe(true);
         expect(result.message).toContain('cleared');
         expect(mockDeactivateSession).toHaveBeenCalledWith('session-123', 'reset-requested');
+        // Real escape hatch: abandon resumable runs + clear the execution binding.
+        expect(mockAbandonResumableRunsForConversation).toHaveBeenCalledWith(baseConversation.id);
+        expect(mockUpdateConversation).toHaveBeenCalledWith(baseConversation.id, {
+          cwd: null,
+          isolation_env_id: null,
+        });
+        // codebase_id (project attachment) must NOT be touched.
+        const updateArgs = mockUpdateConversation.mock.calls.at(-1) as [string, object];
+        expect(updateArgs[1]).not.toHaveProperty('codebase_id');
+        expect(result.message).toContain('Abandoned 2 pending run(s)');
       });
 
-      test('should handle no active session gracefully', async () => {
+      test('should handle no active session gracefully but still clear binding', async () => {
         mockGetActiveSession.mockResolvedValue(null);
+        mockAbandonResumableRunsForConversation.mockResolvedValueOnce(0);
 
         const result = await handleCommand(baseConversation, '/reset');
         expect(result.success).toBe(true);
         expect(result.message).toContain('No active session');
+        // Binding clearing + run abandonment happen regardless of an active session.
+        expect(mockAbandonResumableRunsForConversation).toHaveBeenCalledWith(baseConversation.id);
+        expect(mockUpdateConversation).toHaveBeenCalledWith(baseConversation.id, {
+          cwd: null,
+          isolation_env_id: null,
+        });
       });
     });
 

@@ -1044,19 +1044,31 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
     }
 
     case 'reset': {
+      // /reset is an explicit "start fresh" intent. Beyond deactivating the AI
+      // session it must clear the execution binding (cwd + isolation env) and
+      // abandon any resumable runs — otherwise a stale/hijacked run stays
+      // resumable and the next message resumes it instead of starting fresh
+      // (the wrong-repo-hijack escape hatch). Project attachment (codebase_id)
+      // is intentionally preserved.
       const session = await sessionDb.getActiveSession(conversation.id);
       if (session) {
         await safeDeactivateSession(session.id, 'reset');
-        return {
-          success: true,
-          message:
-            'Session cleared. Starting fresh on next message.\n\nCodebase configuration preserved.',
-        };
       }
-      return {
-        success: true,
-        message: 'No active session to reset.',
-      };
+      let abandoned = 0;
+      try {
+        abandoned = await workflowDb.abandonResumableRunsForConversation(conversation.id);
+        await db.updateConversation(conversation.id, { cwd: null, isolation_env_id: null });
+      } catch (error) {
+        // updateConversation throws if the row vanished — surface anything else.
+        if (!(error instanceof ConversationNotFoundError)) throw error;
+      }
+      const parts = [
+        session ? 'Session cleared.' : 'No active session.',
+        'Cleared workspace binding (worktree + isolation env).',
+      ];
+      if (abandoned > 0) parts.push(`Abandoned ${String(abandoned)} pending run(s).`);
+      parts.push('Project attachment preserved — next message starts fresh.');
+      return { success: true, message: parts.join(' ') };
     }
 
     case 'worktree':

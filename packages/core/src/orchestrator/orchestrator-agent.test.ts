@@ -1424,6 +1424,30 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(opts.preCreatedRun).toBeUndefined();
     expect(opts.priorCompletedNodes).toBeUndefined();
   });
+
+  test('scopes resume lookup to the conversation current codebase (no cross-repo hijack)', async () => {
+    // Regression for the wrong-repo-hijack: dispatch must pass the conversation's
+    // current codebase.id to findResumableRunByParentConversation so a fresh
+    // invocation in a persistent chat never resumes a stale run from another repo.
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    // No same-codebase resumable run → lookup returns null → fresh run.
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(Promise.resolve(null));
+
+    const platform = {
+      ...makePlatform(),
+      getPlatformType: mock(() => 'telegram' as const),
+    };
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+    const lookupArgs = mockFindResumableRunByParentConversation.mock.calls[0] as unknown[];
+    expect(lookupArgs[0]).toBe('test-workflow');
+    expect(lookupArgs[2]).toBe('codebase-1'); // codebase scope
+    // Fresh run on the resolved cwd, no resume payload.
+    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+  });
 });
 
 // ─── Natural-language approval routing ──────────────────────────────────────

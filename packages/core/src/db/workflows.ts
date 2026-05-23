@@ -336,26 +336,62 @@ export async function findResumableRun(
 }
 
 /**
- * Find a resumable (failed/paused) run for a workflow scoped to (parent conversation, codebase).
- * Used by the orchestrator (all platforms) to detect approved runs that need foreground resume
- * on the prior run's worktree. Codebase scope prevents cross-project resume on persistent
- * chat conversation IDs (Telegram chat_id, Slack thread, etc.).
+ * Recency window for auto-resuming a `failed` run. The post-approval handoff
+ * flips a paused gate to `failed` and re-dispatches within ms (and refreshes
+ * last_activity_at — see updateWorkflowRun's approval-transition branch), so a
+ * legit resume always falls well inside this window. A genuinely abandoned old
+ * `failed` run (same workflow + same codebase in a long-lived chat) falls
+ * outside it and is NOT auto-resumed. Generous enough to absorb clock skew
+ * between processes sharing one DB (server container + local CLI).
+ */
+export const RESUME_FAILED_RECENCY_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+/**
+ * Find a resumable (failed/paused) run for a workflow scoped to (parent
+ * conversation, codebase). Used by the orchestrator (all platforms) to detect
+ * approved runs that need foreground resume on the prior run's worktree (a fresh
+ * dispatch would create a new worktree and lose completed nodes + loop_user_input).
+ *
+ * Scoping (critical for persistent chat — Telegram chat_id never changes, so one
+ * conversation accumulates every run ever made across all repos):
+ * - `codebaseId` (required): only resume a run for the project currently attached
+ *   to the conversation — never a stale run from another repo.
+ * - `paused` runs are always candidates (an open gate is legitimately waiting,
+ *   possibly for hours/days) and are preferred over `failed`.
+ * - `failed` runs are candidates only within RESUME_FAILED_RECENCY_MS, so a fresh
+ *   invocation never resumes an ancient unrelated failure in the same chat.
  */
 export async function findResumableRunByParentConversation(
   workflowName: string,
   parentConversationId: string,
   codebaseId: string
 ): Promise<WorkflowRun | null> {
+  const isPostgres = getDatabaseType() === 'postgresql';
+  const params: unknown[] = [workflowName, parentConversationId, codebaseId];
+  const clauses: string[] = [
+    'workflow_name = $1',
+    'parent_conversation_id = $2',
+    'codebase_id = $3',
+  ];
+
+  // Recency cutoff for `failed` only. SQLite stores timestamps as TEXT
+  // ("YYYY-MM-DD HH:MM:SS") while our ISO param is "...THH:MM:SS.mmmZ" — a raw
+  // lexical compare is wrong, so wrap both sides in datetime() (mirrors
+  // getActiveWorkflowRunByPath). Postgres casts the param to timestamptz.
+  const cutoff = new Date(Date.now() - RESUME_FAILED_RECENCY_MS).toISOString();
+  params.push(cutoff);
+  const cutoffParam = `$${String(params.length)}`;
+  const colExpr = isPostgres ? 'last_activity_at' : 'datetime(last_activity_at)';
+  const cutoffExpr = isPostgres ? `${cutoffParam}::timestamptz` : `datetime(${cutoffParam})`;
+  clauses.push(`(status = 'paused' OR (status = 'failed' AND ${colExpr} > ${cutoffExpr}))`);
+
   try {
     const result = await pool.query<WorkflowRun>(
       `SELECT * FROM remote_agent_workflow_runs
-       WHERE workflow_name = $1
-         AND parent_conversation_id = $2
-         AND codebase_id = $3
-         AND status IN ('failed', 'paused')
-       ORDER BY started_at DESC
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY CASE WHEN status = 'paused' THEN 0 ELSE 1 END, started_at DESC
        LIMIT 1`,
-      [workflowName, parentConversationId, codebaseId]
+      params
     );
     const row = result.rows[0];
     return row ? normalizeWorkflowRun(row) : null;
@@ -490,6 +526,13 @@ export async function updateWorkflowRun(
     ) {
       setClauses.push(`completed_at = ${dialect.now()}`);
     }
+    // An approval transition (paused → failed carrying the user's answer) is
+    // real activity: refresh last_activity_at so the immediately-following
+    // resume lookup finds this run inside RESUME_FAILED_RECENCY_MS even when the
+    // gate sat open for hours waiting on a human.
+    if (isApprovalTransition) {
+      setClauses.push(`last_activity_at = ${dialect.now()}`);
+    }
   }
   if (updates.metadata !== undefined) {
     // Use dialect helper for JSON merge - need to calculate the param index
@@ -587,6 +630,35 @@ export async function cancelWorkflowRun(id: string): Promise<void> {
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_cancel_failed');
     throw new Error(`Failed to cancel workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Abandon every non-terminal / resumable run belonging to a conversation.
+ * Used by `/reset` to give the user a real escape hatch — after this, the
+ * resume lookup (findResumableRunByParentConversation) finds nothing, so the
+ * next dispatch starts fresh instead of resuming a stale/hijacked run.
+ *
+ * Includes `failed` on purpose: the approval handoff parks resumable runs in
+ * `failed`, so leaving them would defeat the reset. Matches on both
+ * conversation_id and parent_conversation_id (runs record the conversation in
+ * the latter). Returns the number of runs abandoned.
+ */
+export async function abandonResumableRunsForConversation(conversationId: string): Promise<number> {
+  const dialect = getDialect();
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'cancelled', completed_at = ${dialect.now()}
+       WHERE (conversation_id = $1 OR parent_conversation_id = $1)
+         AND status IN ('pending', 'running', 'paused', 'failed')`,
+      [conversationId]
+    );
+    return result.rowCount ?? 0;
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, conversationId }, 'db.workflow_run_abandon_for_conversation_failed');
+    throw new Error(`Failed to abandon resumable runs for conversation: ${err.message}`);
   }
 }
 

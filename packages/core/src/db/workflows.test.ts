@@ -24,6 +24,8 @@ import {
   failWorkflowRun,
   updateWorkflowActivity,
   findResumableRun,
+  findResumableRunByParentConversation,
+  abandonResumableRunsForConversation,
   resumeWorkflowRun,
   failOrphanedRuns,
   listWorkflowRuns,
@@ -254,6 +256,21 @@ describe('workflows database', () => {
       await updateWorkflowRun('workflow-run-123', {});
 
       expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('approval transition (failed + loop_user_input) refreshes last_activity_at, not completed_at', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', {
+        status: 'failed',
+        metadata: { loop_user_input: 'approved' },
+      });
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // Not a real completion — completed_at must NOT be set.
+      expect(query).not.toContain('completed_at');
+      // But it IS activity — so the resume lookup finds it within the recency window.
+      expect(query).toContain('last_activity_at = NOW()');
     });
   });
 
@@ -543,6 +560,97 @@ describe('workflows database', () => {
 
       await expect(findResumableRun('test', '/path')).rejects.toThrow(
         'Failed to find resumable run: Connection refused'
+      );
+    });
+  });
+
+  describe('findResumableRunByParentConversation', () => {
+    test('scopes by codebase_id when provided', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
+
+      await findResumableRunByParentConversation('piv', 'conv-1', 'codebase-789');
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('workflow_name = $1');
+      expect(query).toContain('parent_conversation_id = $2');
+      expect(query).toContain('codebase_id = $3');
+      // $1, $2, codebase $3, recency cutoff $4
+      expect(params[0]).toBe('piv');
+      expect(params[1]).toBe('conv-1');
+      expect(params[2]).toBe('codebase-789');
+      expect(typeof params[3]).toBe('string'); // ISO cutoff
+    });
+
+    test('omits codebase filter when codebaseId is undefined (backward compat)', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await findResumableRunByParentConversation('piv', 'conv-1');
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).not.toContain('codebase_id =');
+      // $1, $2, recency cutoff $3
+      expect(params).toHaveLength(3);
+      expect(typeof params[2]).toBe('string');
+    });
+
+    test('prefers paused over failed and applies recency only to failed', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await findResumableRunByParentConversation('piv', 'conv-1', 'cb');
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // paused unconditionally; failed gated by recency on last_activity_at
+      expect(query).toContain("status = 'paused' OR (status = 'failed' AND");
+      expect(query).toContain('last_activity_at');
+      // paused-first ordering
+      expect(query).toContain("CASE WHEN status = 'paused' THEN 0 ELSE 1 END");
+    });
+
+    test('returns null when no run matches', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await findResumableRunByParentConversation('piv', 'conv-1', 'cb');
+
+      expect(result).toBeNull();
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+
+      await expect(findResumableRunByParentConversation('piv', 'conv-1')).rejects.toThrow(
+        'Failed to find resumable run by parent conversation: Connection refused'
+      );
+    });
+  });
+
+  describe('abandonResumableRunsForConversation', () => {
+    test('cancels non-terminal + failed runs matching conversation or parent', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 3));
+
+      const count = await abandonResumableRunsForConversation('conv-1');
+
+      expect(count).toBe(3);
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status = 'cancelled'");
+      expect(query).toContain('completed_at = NOW()');
+      expect(query).toContain('(conversation_id = $1 OR parent_conversation_id = $1)');
+      expect(query).toContain("status IN ('pending', 'running', 'paused', 'failed')");
+      expect(params).toEqual(['conv-1']);
+    });
+
+    test('returns 0 when nothing matched', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+
+      const count = await abandonResumableRunsForConversation('conv-1');
+
+      expect(count).toBe(0);
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+
+      await expect(abandonResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Failed to abandon resumable runs for conversation: Connection refused'
       );
     });
   });
