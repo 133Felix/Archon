@@ -447,6 +447,39 @@ describe('parseOrchestratorCommands', () => {
     expect(result.workflowInvocation?.projectName).toBe('dynamous-community/test-project');
     expect(result.workflowInvocation?.synthesizedPrompt).toBe('Fix the bug');
   });
+
+  test('multiple name matches: prefers the codebase whose default_cwd exists here', () => {
+    // Shared-DB dual-context: same repo, two FS-specific rows. The unreachable
+    // one is ordered first (mirrors listCodebases name-ASC putting the
+    // owner-prefixed WSL row before the bare container row); reachability must
+    // override order so dispatch never targets a path that doesn't exist here.
+    // Only the container path is reachable in this process (fs.existsSync is
+    // mocked here — drive it per-path).
+    mockExistsSync.mockImplementation((p: string) => p === '/reachable/container/path');
+    const dual: Codebase[] = [
+      {
+        ...mockCodebase,
+        id: 'wsl',
+        name: '133felix/test-project',
+        default_cwd: '/unreachable/wsl/path',
+      },
+      {
+        ...mockCodebase,
+        id: 'ctr',
+        name: 'test-project',
+        default_cwd: '/reachable/container/path',
+      },
+    ];
+    const response = '/invoke-workflow fix-bug --project test-project';
+    const result = parseOrchestratorCommands(response, dual, workflows);
+
+    expect(result.workflowInvocation).not.toBeNull();
+    // The reachable row (default_cwd exists), NOT the first-by-order WSL row.
+    expect(result.workflowInvocation?.projectName).toBe('test-project');
+
+    // Restore default impl (mockClear in beforeEach does not reset implementation).
+    mockExistsSync.mockImplementation(() => true);
+  });
 });
 
 describe('wrapCommandForExecution', () => {

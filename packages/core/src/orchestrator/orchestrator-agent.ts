@@ -189,10 +189,19 @@ function findCodebaseByName(
   projectName: string
 ): Codebase | undefined {
   const projectLower = projectName.toLowerCase();
-  return codebases.find(c => {
+  const matches = codebases.filter(c => {
     const nameLower = c.name.toLowerCase();
     return nameLower === projectLower || nameLower.endsWith(`/${projectLower}`);
   });
+  if (matches.length <= 1) return matches[0];
+  // Shared-DB dual-context: the same repo can have two rows whose default_cwd
+  // is FS-specific (e.g. a server-container path vs a WSL dev-box path). Both
+  // match the name, but only one is reachable in the process running now.
+  // Prefer the reachable one so a workflow never dispatches against a path that
+  // doesn't exist here (which fails in syncWorkspaceBeforeCreate). Falls back to
+  // the first match when none are reachable (preserves prior behavior).
+  const reachable = matches.find(c => c.default_cwd && existsSync(c.default_cwd));
+  return reachable ?? matches[0];
 }
 
 /**
