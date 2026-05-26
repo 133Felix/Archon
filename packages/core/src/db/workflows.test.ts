@@ -581,18 +581,6 @@ describe('workflows database', () => {
       expect(typeof params[3]).toBe('string'); // ISO cutoff
     });
 
-    test('omits codebase filter when codebaseId is undefined (backward compat)', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([]));
-
-      await findResumableRunByParentConversation('piv', 'conv-1');
-
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).not.toContain('codebase_id =');
-      // $1, $2, recency cutoff $3
-      expect(params).toHaveLength(3);
-      expect(typeof params[2]).toBe('string');
-    });
-
     test('prefers paused over failed and applies recency only to failed', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
@@ -617,7 +605,7 @@ describe('workflows database', () => {
     test('throws on database error', async () => {
       mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
 
-      await expect(findResumableRunByParentConversation('piv', 'conv-1')).rejects.toThrow(
+      await expect(findResumableRunByParentConversation('piv', 'conv-1', 'cb')).rejects.toThrow(
         'Failed to find resumable run by parent conversation: Connection refused'
       );
     });
