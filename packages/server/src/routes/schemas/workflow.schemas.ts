@@ -167,6 +167,14 @@ export const rejectWorkflowRunBodySchema = z
   .object({ reason: z.string().optional() })
   .openapi('RejectWorkflowRunBody');
 
+/** DELETE /api/workflows/:name/node-sessions response. */
+export const resetWorkflowNodeSessionsResponseSchema = z
+  .object({
+    success: z.boolean(),
+    deleted: z.number().int().nonnegative(),
+  })
+  .openapi('ResetWorkflowNodeSessionsResponse');
+
 /** Dashboard enriched workflow run (with joined codebase/conversation data). */
 export const dashboardWorkflowRunSchema = workflowRunSchema
   .extend({
